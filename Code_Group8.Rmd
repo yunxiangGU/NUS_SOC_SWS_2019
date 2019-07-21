@@ -1,0 +1,377 @@
+## Load package and import Dataset
+
+```{r}
+# Import the packages we would use
+library(dplyr)
+library(caret)
+library(Metrics)
+library(gmodels)
+
+# Read in the pre-cleaned dataset (50,000 observations, 52 features)
+down_sample <- read.csv("my_data.csv")
+
+# Normalize numerical features
+my_data<-subset(down_sample,select=-c(Class))
+nums <- unlist(lapply(my_data, is.numeric))
+pp <- preProcess(my_data[ , nums],method="range")
+my_data <- predict(pp, my_data)
+
+#One Hot
+dmy <- dummyVars(" ~ .", data = my_data)
+trsf <- data.frame(predict(dmy, newdata = my_data))
+trsf$Class<-down_sample$Class
+
+#delete variables with small variance
+zerovar=nearZeroVar(trsf)
+trsf=trsf[,-zerovar]
+
+# Divide the dataset into training (80%) and testing (20%) dataset
+set.seed(666)
+sam_num<-sample(c(nrow(trsf)),0.8*nrow(trsf))
+all_train<-trsf[sam_num,]
+all_test<-trsf[-sam_num,]
+
+down_index<-grep("Class",colnames(all_train))
+sam_train<-trsf[sam_num,-down_index]
+sam_test<-trsf[-sam_num,-down_index]
+train_label<-as.numeric(as.factor(down_sample$Class[sam_num]))-1
+test_label<-as.numeric(as.factor(all_test$Class))-1
+```
+
+
+```{r}
+#Feature selection with XGBoost
+library(xgboost)
+dtrain <- xgb.DMatrix(as.matrix(sam_train), label=train_label)
+dtest <- xgb.DMatrix(as.matrix(sam_test))
+xgb <- xgboost(data = dtrain,
+               eta = 0.3,
+               max_depth = 5, 
+               nround=100, 
+               gamma=0,
+               subsample = 1,
+               colsample_bytree = 0.6,
+               min_child_weight = 1,
+               objective = "binary:logistic",
+               eval_metric = "auc"
+)
+
+# Print the importance matrix to see important features
+importance_matrix <- xgb.importance(model = xgb)
+print(importance_matrix)
+
+# Print out the training and testing accuracy
+predicted_test = predict(xgb,dtest)
+predicted_test = ifelse(predicted_test > 0.5, 1, 0)
+sum(predicted_test == test_label)/length(test_label)
+
+predicted_train = predict(xgb,dtrain)
+predicted_train = ifelse(predicted_train > 0.5, 1, 0)
+sum(predicted_train == train_label)/length(train_label)
+```
+
+Features to keep: last_pymnt_amnt
+
+```{r}
+#keep 12 features
+trsf2<-data.frame(trsf$last_pymnt_amnt,trsf$installment,trsf$Class,trsf$term..60.months,trsf$grade.A,trsf$int_rate,trsf$loan_amnt,trsf$term..36.months,trsf$acc_open_past_24mths,trsf$dti,trsf$revol_bal,trsf$tot_hi_cred_lim,trsf$grade.B)
+trsf2$Class<-trsf2[,3]
+trsf2<-subset(trsf2,select = -c(3))
+
+#training and testing
+set.seed(666)
+trsf_index<-which(colnames(trsf2)=="Class")
+sam_num<-sample(c(nrow(trsf2)),0.8*nrow(trsf2))
+all_train<-trsf2[sam_num,]
+all_test<-trsf2[-sam_num,]
+
+sam_train<-trsf2[sam_num,-trsf_index]
+sam_test<-trsf2[-sam_num,-trsf_index]
+train_label<-as.numeric(as.factor(trsf2$Class[sam_num]))-1
+test_label<-as.numeric(as.factor(all_test$Class))-1
+```
+
+## Baseline Models
+
+###KNN
+```{r}
+library(class)
+knn_results <- knn(train = all_train[,-ncol(all_train)], test = all_test[,-ncol(all_test)], cl = all_train[,ncol(all_train)], k = 8)
+sum(knn_results==test_label)/length(test_label)
+```
+
+###Decision Tree
+
+```{r}
+library(C50)
+DT_model <- C5.0(sam_train, factor(train_label),control = C5.0Control(minCases = 10))
+summary(DT_model)
+credit_pred_pruned <- predict(DT_model, sam_test)
+
+sum(credit_pred_pruned==test_label)/length(test_label)
+```
+
+###Random Forest
+
+```{r}
+library(randomForest)
+all_train$Class<-factor(all_train$Class)
+all_test$Class<-factor(all_test$Class)
+num_label<-grep("Class",colnames(all_train))
+rf <- randomForest(Class~., data=all_train, mtry = 5, ntree = 500)
+rf_results <- as.numeric(predict(rf, all_test[,-num_label]))-1
+sum(rf_results==test_label)/length(test_label)
+```
+
+
+###SVM
+```{r}
+library(e1071)
+
+svm3 = svm(Class ~ ., data=all_train, type='C-classification', kernel='radial')
+svm3_result <- predict(svm3, sam_test)
+CrossTable(test_label, svm3_result)
+
+```
+
+###Neural Network
+```{r}
+library(neuralnet)
+
+nn_model <- neuralnet(Class ~ trsf.last_pymnt_amnt + trsf.int_rate + trsf.dti + trsf.loan_amnt + trsf.installment + trsf.grade.A + trsf.term..36.months + trsf.acc_open_past_24mths + trsf.revol_bal + trsf.tot_hi_cred_lim + trsf.grade.B + trsf.term..60.months, data = all_train, act.fct = "logistic")
+plot(nn_model)
+nn_results <- compute(nn_model, sam_test)
+#nn_result <- nn_results$net.result 
+
+predicted_test = predict(nn_model,sam_test)
+predicted_test = ifelse(predicted_test > 0.5, 1, 0)
+sum(predicted_test == test_label)/length(test_label)
+
+predicted_train = predict(nn_model,sam_train)
+predicted_train = ifelse(predicted_train > 0.5, 1, 0)
+sum(predicted_train == train_label)/length(train_label)
+#CrossTable(test_label, nn_result)
+```
+
+##Advanced Machine Learning Methods
+
+```{r}
+###Tuning with CARET
+grid <- expand.grid(.nrounds=c(20,30,40,50),.eta=c(0.2,0.25,0.3),.gamma=c(0,1),.max_depth=c(2,3),.colsample_bytree=c(0.6,0.7,0.8,0.9,1),.subsample=c(1),.min_child_weight=c(1))
+starttime<-Sys.time()
+set.seed(1234)
+ctrl <- trainControl(method = "cv", number = 5)
+all_train$Class<-as.factor(all_train$Class)
+m <- train(Class ~ ., data = all_train, method = "xgbTree", trControl = ctrl, tuneGrid = grid)
+endtime<-Sys.time()
+(endtime-starttime)
+m
+
+# Run XGBoost to determine important features with the best tuning parameters
+library(xgboost)
+dtrain <- xgb.DMatrix(as.matrix(sam_train), label=train_label)
+dtest <- xgb.DMatrix(as.matrix(sam_test))
+xgb <- xgboost(data = dtrain,
+               eta = 0.3,
+               max_depth = 5, 
+               nround=100, 
+               gamma=0,
+               subsample = 1,
+               colsample_bytree = 0.6,
+               min_child_weight = 1,
+               objective = "binary:logistic",
+               eval_metric = "auc"
+)
+
+# Print the importance matrix to see important features
+importance_matrix <- xgb.importance(model = xgb)
+print(importance_matrix)
+
+# Print out the training and testing accuracy
+predicted_test = predict(xgb,dtest)
+predicted_test = ifelse(predicted_test > 0.5, 1, 0)
+sum(predicted_test == test_label)/length(test_label)
+
+predicted_train = predict(xgb,dtrain)
+predicted_train = ifelse(predicted_train > 0.5, 1, 0)
+sum(predicted_train == train_label)/length(train_label)
+```
+
+### Stacking
+
+```{r}
+library(randomForest)
+all_train$Class<-factor(all_train$Class)
+all_test$Class<-factor(all_test$Class)
+level0<-all_train[1:30000,]
+level1<-all_train[30001:nrow(all_train),]
+test<-all_test
+num_label<-grep("Class",colnames(all_train))
+model_C50 <- C5.0(level0[,-num_label],level0$Class)
+models_rf <- randomForest(Class~., data=level0, mtry = 100, ntree = 1000)
+
+# Level 1 predictions, because we will use regressions, we need to use numerical features 
+pred_C50 <- as.numeric(predict(model_C50, level1[,-num_label]))-1
+pred_knn <- as.numeric(knn(level0[,-num_label], level1[,-num_label], cl=level0$Class, k=5))-1
+pred_rf <- as.numeric(predict(models_rf, level1[,-num_label]))-1
+
+# combine the predicted values and true values of test set
+level1_train <- as.data.frame(cbind(pred_C50, pred_knn, pred_rf))
+level1_train$Class <- as.numeric(level1$Class)-1
+
+# meta-learning by logistic regression, you can use more complicated model here
+lm <- glm(Class ~ ., data=level1_train, family = binomial(link = "logit"))
+
+# Level 0 predictions 
+pred_C50 <- as.numeric(predict(model_C50, test[,-num_label]))-1
+pred_knn <- as.numeric(knn(level0[,-num_label], test[,-num_label], cl=level0$Class, k=9))-1
+pred_rf <- as.numeric(predict(models_rf, test[,-num_label]))-1
+
+# combine the predicted values and true values of test set
+level1_test <- as.data.frame(cbind(pred_C50, pred_knn, pred_rf))
+level1_test$Class <- as.numeric(test$Class)-1
+
+# meta-learning prediction
+predicted_prob <- predict(lm, newdata=level1_test, type="response")
+predcted_value <- as.numeric(predicted_prob>0.5) # convert predicted prob. to binary dv by threshold=50%
+
+cat('Stacking Accuracy:', mean(as.factor(predcted_value)==test$Class), '\n') # this stacking performance is very poor
+
+# Comparing the stacking Accuracy with level0 models
+cat('c50 Accuracy:', mean(as.factor(pred_C50)==test$Class), '\n')
+cat('knn Accuracy:', mean(as.factor(pred_knn)==test$Class), '\n')
+cat('rf Accuracy:', mean(as.factor(pred_rf)==test$Class), '\n')
+```
+
+## Feature Engineering
+
+```{r}
+#Discretize interest rate and multiplied by grade (add 4 new features)
+rate <- matrix(data=NA,nrow=nrow(trsf),ncol=2,byrow=FALSE,dimnames = NULL)
+rate[,1] <- ifelse(trsf$int_rate<0.15,1,0)
+rate[,2] <- ifelse(trsf$int_rate>0.15&trsf$int_rate<0.35,1,0)
+
+multiply1 <- matrix(data=NA,nrow=nrow(trsf),ncol=4,byrow=FALSE,dimnames = NULL)
+for (i in 1:2)
+        multiply1[,i] <- trsf$grade.A*rate[,i]
+for (i in 3:4)
+        multiply1[,i] <- trsf$grade.B*rate[,i-2]
+
+trsf2$intXgrade1<-multiply1[,1]
+trsf2$intXgrade2<-multiply1[,2]
+trsf2$intXgrade3<-multiply1[,3]
+trsf2$intXgrade4<-multiply1[,4]
+
+#payment amount, int rate, grade, term
+parameter <- 0.03/(0.01+trsf$last_pymnt_amnt)
+Cor_factors <- parameter*trsf$int_rate*ifelse(trsf$grade.A, 0.1, 1.1)
+principal_due <- (trsf$loan_amnt - trsf$last_pymnt_amnt*ifelse(trsf$term..36.months == 1, 4, 7))
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+principal_due<-normalize(principal_due)
+trsf2$Cor_factors<-Cor_factors
+trsf2$principal_due<-principal_due
+
+trsf2<-trsf2[,!grepl("trsf.grade.B", colnames(trsf2))]
+trsf2<-trsf2[,!grepl("trsf.grade.A", colnames(trsf2))]
+
+#training testing
+set.seed(666)
+trsf_index<-which(colnames(trsf2)=="Class")
+sam_num<-sample(c(nrow(trsf2)),0.8*nrow(trsf2))
+all_train<-trsf2[sam_num,]
+all_test<-trsf2[-sam_num,]
+
+sam_train<-trsf2[sam_num,-trsf_index]
+sam_test<-trsf2[-sam_num,-trsf_index]
+train_label<-as.numeric(as.factor(trsf2$Class[sam_num]))-1
+test_label<-as.numeric(as.factor(all_test$Class))-1
+```
+
+###XGBoost, Stacking, LightGBM, Random Forest comparison
+
+```{r}
+#RF
+all_train$Class<-factor(all_train$Class)
+all_test$Class<-factor(all_test$Class)
+num_label<-grep("Class",colnames(all_train))
+rf <- randomForest(Class~., data=all_train, mtry = 5, ntree = 500)
+rf_results <- as.numeric(predict(rf, all_test[,-num_label]))-1
+sum(rf_results==test_label)/length(test_label)
+```
+
+```{r}
+set.seed(1234)
+library(xgboost)
+dtrain <- xgb.DMatrix(as.matrix(sam_train), label=train_label)
+dtest <- xgb.DMatrix(as.matrix(sam_test))
+xgb <- xgboost(data = dtrain,
+               eta = 0.3,
+               max_depth = 5, 
+               nround=100, 
+               gamma=0,
+               subsample = 1,
+               colsample_bytree = 0.6,
+               min_child_weight = 1,
+               objective = "binary:logistic",
+               eval_metric = "auc"
+)
+
+# Print the importance matrix to see important features
+importance_matrix <- xgb.importance(model = xgb)
+print(importance_matrix)
+predicted_test = predict(xgb,dtest)
+predicted_test = ifelse(predicted_test > 0.5, 1, 0)
+sum(predicted_test == test_label)/length(test_label)
+
+predicted_train = predict(xgb,dtrain)
+predicted_train = ifelse(predicted_train > 0.5, 1, 0)
+sum(predicted_train == train_label)/length(train_label)
+```
+
+```{r}
+library(randomForest)
+all_train$Class<-factor(all_train$Class)
+all_test$Class<-factor(all_test$Class)
+level0<-all_train[1:30000,]
+level1<-all_train[30001:nrow(all_train),]
+test<-all_test
+num_label<-grep("Class",colnames(all_train))
+model_C50 <- C5.0(level0[,-num_label],level0$Class)
+models_rf <- randomForest(Class~., data=level0, mtry = 100, ntree = 1000)
+
+# Level 1 predictions, because we will use regressions, we need to use numerical features 
+pred_C50 <- as.numeric(predict(model_C50, level1[,-num_label]))-1
+pred_knn <- as.numeric(knn(level0[,-num_label], level1[,-num_label], cl=level0$Class, k=5))-1
+pred_rf <- as.numeric(predict(models_rf, level1[,-num_label]))-1
+
+# combine the predicted values and true values of test set
+level1_train <- as.data.frame(cbind(pred_C50, pred_knn, pred_rf))
+level1_train$Class <- as.numeric(level1$Class)-1
+
+# meta-learning by logistic regression, you can use more complicated model here
+lm <- glm(Class ~ ., data=level1_train, family = binomial(link = "logit"))
+
+# Level 0 predictions 
+pred_C50 <- as.numeric(predict(model_C50, test[,-num_label]))-1
+pred_knn <- as.numeric(knn(level0[,-num_label], test[,-num_label], cl=level0$Class, k=9))-1
+pred_rf <- as.numeric(predict(models_rf, test[,-num_label]))-1
+
+# combine the predicted values and true values of test set
+level1_test <- as.data.frame(cbind(pred_C50, pred_knn, pred_rf))
+level1_test$Class <- as.numeric(test$Class)-1
+
+# meta-learning prediction
+predicted_prob <- predict(lm, newdata=level1_test, type="response")
+predcted_value <- as.numeric(predicted_prob>0.5) # convert predicted prob. to binary dv by threshold=50%
+
+cat('Stacking Accuracy:', mean(as.factor(predcted_value)==test$Class), '\n') # this stacking performance is very poor
+
+# Comparing the stacking Accuracy with level0 models
+cat('c50 Accuracy:', mean(as.factor(pred_C50)==test$Class), '\n')
+cat('knn Accuracy:', mean(as.factor(pred_knn)==test$Class), '\n')
+cat('rf Accuracy:', mean(as.factor(pred_rf)==test$Class), '\n')
+
+```
+
